@@ -1,0 +1,124 @@
+# Copyright 2018 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+#     Unless required by applicable law or agreed to in writing, software
+#     distributed under the License is distributed on an "AS IS" BASIS,
+#     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#     See the License for the specific language governing permissions and
+#     limitations under the License.
+
+# This Service exposes the Prometheus metrics handler. If Prometheus metrics
+# are not needed, remove this Service.
+kind: Service
+apiVersion: v1
+metadata:
+  # Unique key of the Service instance
+  name: cloudprober-service
+spec:
+  ports:
+    # Accept traffic sent to port 9313
+    - name: metrics
+      port: 9313
+      targetPort: 9313
+  selector:
+    # Loadbalance traffic across Pods matching
+    # this label selector
+    app: cloudprober
+  # Create an HA proxy in the cloud provider
+  # with an External IP address - *Only supported
+  # by some cloud providers*
+  type: LoadBalancer
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: config-helper-configmap
+data:
+  configure.sh: |-
+    #!/bin/bash
+    cat /targets/targets | ( while read NAME ID URL; do
+    cat <<EOF
+    probe {
+      name: "${NAME}"
+      type: EXTERNAL
+      targets { dummy_targets {} }
+      external_probe {
+        mode: SERVER
+        command: "/data/iaprober --server --credentials=/auth/auth.json"
+        options: {
+          name: "url"
+          value: "${URL}"
+        }
+        options: {
+          name: "client_id"
+          value: "${ID}"
+        }
+      }
+      interval_msec: 5000  # 5s
+      timeout_msec: 1000   # 1s
+    }
+    EOF
+    done
+    ) > /data/cloudprober.cfg
+---
+kind: Deployment
+apiVersion: apps/v1beta1
+metadata:
+  name: cloudprober
+spec:
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: cloudprober
+    spec:
+      initContainers:
+        - name: copy-iaprober-binary
+          image: gcr.io/[YOUR PROJECT HERE]/identity-aware-prober:live
+          command: ["/bin/cp", "/iaprober", "/data/"]
+          volumeMounts:
+            - name: config-data
+              mountPath: /data
+        - name: configure-cloudprober
+          image: busybox
+          command: ["/bin/sh", "/bin/configure.sh"]
+          volumeMounts:
+            - name: config-data
+              mountPath: /data
+            - name: targets
+              mountPath: /targets
+            - name: config-helper
+              mountPath: /bin/configure.sh
+              readOnly: true
+              subPath: configure.sh
+      containers:
+        - name: cloudprober
+          image: "cloudprober/cloudprober"
+          args: ["--config_file",  "/data/cloudprober.cfg"]
+          volumeMounts:
+            - name: service-account
+              mountPath: /auth
+            - name: config-data
+              mountPath: /data
+          ports:
+            - name: prometheus
+              containerPort: 9313
+      volumes:
+        - name: service-account
+          secret:
+            secretName: service-account
+        - name: config-data
+          emptyDir: {}
+        - name: config-helper
+          configMap:
+            defaultMode: 0700
+            name: config-helper-configmap
+        - name: targets
+          configMap:
+            defaultMode: 0600
+            name: targets
